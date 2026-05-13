@@ -1,5 +1,6 @@
 const User = require("../models/user");
 const Schedule = require("../models/Schedule");
+const WalletTransaction = require("../models/WalletTransaction");
 const writeAuditLog = require("../utils/auditLogger");
 const notifyUser = require("../utils/notify");
 const CASH_ORDER_COMMISSION = Number(process.env.CASH_ORDER_COMMISSION || 50);
@@ -49,6 +50,50 @@ exports.completeJob = async (req, res) => {
         await job.save();
 
         if (job.paymentType === "cash") {
+            await WalletTransaction.updateOne(
+                { worker: job.worker, schedule: job._id, type: "cash_collected" },
+                {
+                    $setOnInsert: {
+                        worker: job.worker,
+                        schedule: job._id,
+                        type: "cash_collected",
+                        direction: "credit",
+                        amount: job.finalPrice.amount,
+                        currency: job.finalPrice.currency || "EGP",
+                        paymentType: "cash",
+                        description: `Cash collected for ${job.service || "service"} job`,
+                        status: "posted",
+                        metadata: {
+                            customer: job.customer,
+                            completedAt: new Date()
+                        }
+                    }
+                },
+                { upsert: true }
+            );
+
+            await WalletTransaction.updateOne(
+                { worker: job.worker, schedule: job._id, type: "platform_fee" },
+                {
+                    $setOnInsert: {
+                        worker: job.worker,
+                        schedule: job._id,
+                        type: "platform_fee",
+                        direction: "debit",
+                        amount: CASH_ORDER_COMMISSION,
+                        currency: job.finalPrice.currency || "EGP",
+                        paymentType: "cash",
+                        description: "Platform commission for cash order",
+                        status: "posted",
+                        metadata: {
+                            customer: job.customer,
+                            completedAt: new Date()
+                        }
+                    }
+                },
+                { upsert: true }
+            );
+
             await User.findByIdAndUpdate(job.worker, {
                 $inc: { cashDebt: CASH_ORDER_COMMISSION }
             });
