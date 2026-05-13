@@ -3,6 +3,7 @@ const router = express.Router();
 const Schedule = require("../models/Schedule");
 const { protect, workerOnly, customerOnly } = require("../middleware/authMiddleware");
 const User = require("../models/user");
+const PromoRedemption = require("../models/PromoRedemption");
 const writeAuditLog = require("../utils/auditLogger");
 const { getPromoCode, applyPromoToAmount, applyPromoToEstimate } = require("../utils/promoCodes");
 const notifyUser = require("../utils/notify");
@@ -92,6 +93,65 @@ router.get("/worker-ratings/:id", getWorkerRatings);
 router.put("/complete/:id", protect, workerOnly, completeJob);
 router.put("/cancel/:id", protect, workerOnly, cancelJob);
 router.get("/customer", protect, customerOnly, getCustomerJobs);
+
+router.get("/promo/:code", protect, customerOnly, async (req, res) => {
+    try {
+        const promo = getPromoCode(req.params.code);
+
+        if (!promo) {
+            return res.status(404).json({ message: "Invalid promo code" });
+        }
+
+        const used = await PromoRedemption.exists({
+            customer: req.user.id,
+            code: promo.code
+        });
+
+        if (used) {
+            return res.status(409).json({ message: "You already used this promo code" });
+        }
+
+        res.json({
+            code: promo.code,
+            discountPercent: promo.discountPercent,
+            label: promo.label,
+            maxDiscount: promo.maxDiscount || null,
+            currency: "EGP"
+        });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+router.get("/public-reviews", async (req, res) => {
+    try {
+        const reviews = await Schedule.find({
+            status: "completed",
+            rating: { $gt: 0 },
+            review: { $exists: true, $ne: "" }
+        })
+            .populate("customer", "name")
+            .populate("worker", "name")
+            .select("service rating review customer worker date")
+            .sort({ updatedAt: -1 })
+            .limit(12)
+            .lean();
+
+        res.json(
+            reviews.map((item) => ({
+                _id: item._id,
+                name: item.customer?.name || "Customer",
+                workerName: item.worker?.name || "",
+                service: item.service,
+                text: item.review,
+                rating: item.rating,
+                date: item.date
+            }))
+        );
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
 
 router.post("/add", protect, workerOnly, async (req, res) => {
     try {
@@ -482,6 +542,17 @@ router.post("/book/:id", protect, customerOnly, async (req, res) => {
             return res.status(400).json({ message: "Invalid promo code" });
         }
 
+        if (promo) {
+            const used = await PromoRedemption.exists({
+                customer: req.user.id,
+                code: promo.code
+            });
+
+            if (used) {
+                return res.status(409).json({ message: "You already used this promo code" });
+            }
+        }
+
         if (!bookingAddress) {
             return res.status(400).json({ message: "Address is required" });
         }
@@ -512,6 +583,21 @@ router.post("/book/:id", protect, customerOnly, async (req, res) => {
         s.finalPrice = { status: "none", currency: "EGP" };
 
         await s.save({ validateBeforeSave: false });
+
+        if (promo) {
+            const originalMin = s.estimatedPrice?.originalMin || s.estimatedPrice?.min || 0;
+            const discountAmount = Math.max(0, originalMin - (s.estimatedPrice?.min || 0));
+
+            await PromoRedemption.create({
+                customer: req.user.id,
+                schedule: s._id,
+                code: promo.code,
+                discountPercent: promo.discountPercent,
+                discountAmount,
+                currency: "EGP"
+            });
+        }
+
         await writeAuditLog(req, {
             action: "booking.create",
             resource: "Schedule",
